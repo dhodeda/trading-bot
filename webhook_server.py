@@ -9,9 +9,11 @@ import logging
 from pybit.unified_trading import HTTP, WebSocket
 from retry import retry
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 import asyncio
 from flask import Flask, request, jsonify
+import git
+import shutil
 
 # טעינת קובץ .env
 load_dotenv()
@@ -29,26 +31,43 @@ LEVERAGE = int(os.getenv("LEVERAGE", 5))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 100))
 RISK_REWARD_RATIO = float(os.getenv("RISK_REWARD_RATIO", 0.33))
 NGROK_URL = os.getenv("NGROK_URL")
+GITHUB_REPO_URL = "https://github.com/dhodeda/trading-bot.git"
 
 # חיבור ל-Bybit
 bybit = HTTP(testnet=False, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
 ws = WebSocket(testnet=False, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, channel_type="linear")
 
 # חיבור לטלגרם
-bot = Bot(TELEGRAM_BOT_TOKEN)
-updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
+app_telegram = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
 # Flask עבור Webhook
-app = Flask(__name__)
+app_flask = Flask(__name__)
+
+# עדכון הקוד מ-GitHub
+def update_code_from_github():
+    try:
+        repo_dir = "temp_repo"
+        if os.path.exists(repo_dir):
+            shutil.rmtree(repo_dir)
+        repo = git.Repo.clone_from(GITHUB_REPO_URL, repo_dir)
+        with open(os.path.join(repo_dir, "webhook_server.py"), "r", encoding="utf-8") as f:
+            new_code = f.read()
+        with open("webhook_server.py", "w", encoding="utf-8") as f:
+            f.write(new_code)
+        logger.info("קוד עודכן בהצלחה מ-GitHub!")
+        asyncio.run(send_telegram_alert("✅ הקוד עודכן בהצלחה מ-GitHub!"))
+        os._exit(0)  # הפעלה מחדש של התוכנית
+    except Exception as e:
+        logger.error(f"שגיאה בעדכון הקוד מ-GitHub: {str(e)}")
 
 # שליחת הודעה לטלגרם עם כפתורים
 async def send_telegram_alert(message, buttons=None):
     try:
         if buttons:
             keyboard = InlineKeyboardMarkup(buttons)
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, reply_markup=keyboard, parse_mode='Markdown')
+            await app_telegram.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, reply_markup=keyboard, parse_mode='Markdown')
         else:
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='Markdown')
+            await app_telegram.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"שליחת הודעה לטלגרם נכשלה: {str(e)}")
 
@@ -86,7 +105,7 @@ def calculate_position_size(entry_price, symbol, risk_amount=RISK_PER_TRADE, lev
         return round(position_size, 3)
     except Exception as e:
         logger.error(f"שגיאה בחישוב גודל פוזיציה: {str(e)}")
-        return 0.01  # ברירת מחדל
+        return 0.01
 
 # חישוב SL/TP דינמי
 def calculate_sl_tp(price, trade_type):
@@ -97,7 +116,7 @@ def calculate_sl_tp(price, trade_type):
     
     if trade_type == "long":
         sl = price - (atr * (1 / RISK_REWARD_RATIO))
-        tp = price + (atr * (1 / RISK_REWARD_RATIO) * 2)  # 1:2 RR
+        tp = price + (atr * (1 / RISK_REWARD_RATIO) * 2)
     else:
         sl = price + (atr * (1 / RISK_REWARD_RATIO))
         tp = price - (atr * (1 / RISK_REWARD_RATIO) * 2)
@@ -192,16 +211,16 @@ def monitor_market(symbol="BTCUSDT"):
             time.sleep(5)
 
 # טיפול בפקודות מטלגרם
-def handle_trade(update, context):
+async def handle_trade(update, context):
     query = update.callback_query
     data = query.data.split(":")
     if data[0] == "trade":
         symbol, side, price, sl, tp, qty = data[1], data[2], float(data[3]), float(data[4]), float(data[5]), float(data[6])
-        asyncio.run(place_order(symbol, side, price, qty, sl, tp))
-    query.answer()
+        await place_order(symbol, side, price, qty, sl, tp)
+    await query.answer()
 
 # Webhook של Flask
-@app.route('/webhook', methods=['POST'])
+@app_flask.route('/webhook', methods=['POST'])
 def webhook():
     try:
         data = request.get_json()
@@ -217,10 +236,16 @@ def webhook():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
 
+# עדכון תקופתי
+def periodic_update():
+    while True:
+        time.sleep(3600)  # בדיקה כל שעה
+        update_code_from_github()
+
 # הרצת הבוט
 if __name__ == "__main__":
-    updater.dispatcher.add_handler(CallbackQueryHandler(handle_trade))
+    app_telegram.add_handler(CallbackQueryHandler(handle_trade))
     threading.Thread(target=monitor_market, args=("BTCUSDT",), daemon=True).start()
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=False), daemon=True).start()
-    updater.start_polling()
-    updater.idle()
+    threading.Thread(target=lambda: app_flask.run(host='0.0.0.0', port=5000, debug=False), daemon=True).start()
+    threading.Thread(target=periodic_update, daemon=True).start()
+    app_telegram.run_polling()
